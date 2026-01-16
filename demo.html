@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>2D Blocking Editor - Demo</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 0; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useCallback } = React;
+
+    const LevelEditor = () => {
+      const [backgroundImage, setBackgroundImage] = useState(null);
+      const [blocks, setBlocks] = useState([]);
+      const [walls, setWalls] = useState([]);
+      const [polygons, setPolygons] = useState([]);
+      const [currentPolygon, setCurrentPolygon] = useState(null);
+      const [currentWallStart, setCurrentWallStart] = useState(null);
+      const [selectedBlockId, setSelectedBlockId] = useState(null);
+      const [selectedWallId, setSelectedWallId] = useState(null);
+      const [selectedPolygonId, setSelectedPolygonId] = useState(null);
+      const [tool, setTool] = useState('select');
+      const [player, setPlayer] = useState({ x: 100, y: 100, radius: 15 });
+      const [isPlaying, setIsPlaying] = useState(false);
+      const [showBlocks, setShowBlocks] = useState(true);
+      const [showWalls, setShowWalls] = useState(true);
+      const [showPolygons, setShowPolygons] = useState(true);
+      const [keysPressed, setKeysPressed] = useState({});
+      const [gridSnap, setGridSnap] = useState(false);
+      const [gridSize, setGridSize] = useState(20);
+      const [wallThickness, setWallThickness] = useState(10);
+      const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+      
+      const canvasRef = useRef(null);
+      const fileInputRef = useRef(null);
+      const dragStart = useRef(null);
+      const originalBlock = useRef(null);
+
+      const PLAYER_SPEED = 4;
+      const CANVAS_WIDTH = 800;
+      const CANVAS_HEIGHT = 600;
+      const CLOSE_POLYGON_DISTANCE = 15;
+
+      const snapToGrid = (value) => {
+        if (!gridSnap) return value;
+        return Math.round(value / gridSize) * gridSize;
+      };
+
+      const handleImageUpload = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            setBackgroundImage(event.target.result);
+          };
+          reader.readAsDataURL(file);
+        }
+      };
+
+      const getMousePos = (e) => {
+        const rect = canvasRef.current.getBoundingClientRect();
+        return {
+          x: e.clientX - rect.left,
+          y: e.clientY - rect.top
+        };
+      };
+
+      const pointInRotatedRect = (px, py, block) => {
+        const cx = block.x + block.width / 2;
+        const cy = block.y + block.height / 2;
+        const angle = -block.rotation * Math.PI / 180;
+        
+        const rotatedX = Math.cos(angle) * (px - cx) - Math.sin(angle) * (py - cy) + cx;
+        const rotatedY = Math.sin(angle) * (px - cx) + Math.cos(angle) * (py - cy) + cy;
+        
+        return rotatedX >= block.x && rotatedX <= block.x + block.width &&
+               rotatedY >= block.y && rotatedY <= block.y + block.height;
+      };
+
+      const findBlockAtPosition = (x, y) => {
+        for (let i = blocks.length - 1; i >= 0; i--) {
+          if (pointInRotatedRect(x, y, blocks[i])) {
+            return blocks[i];
+          }
+        }
+        return null;
+      };
+
+      const pointToLineDistance = (px, py, x1, y1, x2, y2) => {
+        const A = px - x1;
+        const B = py - y1;
+        const C = x2 - x1;
+        const D = y2 - y1;
+        
+        const dot = A * C + B * D;
+        const lenSq = C * C + D * D;
+        let param = -1;
+        
+        if (lenSq !== 0) param = dot / lenSq;
+        
+        let xx, yy;
+        
+        if (param < 0) {
+          xx = x1;
+          yy = y1;
+        } else if (param > 1) {
+          xx = x2;
+          yy = y2;
+        } else {
+          xx = x1 + param * C;
+          yy = y1 + param * D;
+        }
+        
+        const dx = px - xx;
+        const dy = py - yy;
+        return Math.sqrt(dx * dx + dy * dy);
+      };
+
+      const findWallAtPosition = (x, y) => {
+        for (let i = walls.length - 1; i >= 0; i--) {
+          const wall = walls[i];
+          const dist = pointToLineDistance(x, y, wall.x1, wall.y1, wall.x2, wall.y2);
+          if (dist <= wall.thickness / 2 + 5) {
+            return wall;
+          }
+        }
+        return null;
+      };
+
+      const pointInPolygon = (px, py, points) => {
+        let inside = false;
+        for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+          const xi = points[i].x, yi = points[i].y;
+          const xj = points[j].x, yj = points[j].y;
+          
+          if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
+            inside = !inside;
+          }
+        }
+        return inside;
+      };
+
+      const distance = (x1, y1, x2, y2) => {
+        return Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+      };
+
+      const handleCanvasClick = (e) => {
+        if (isPlaying) return;
+        
+        const pos = getMousePos(e);
+        const snappedPos = { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
+        
+        if (tool === 'pen') {
+          if (!currentPolygon) {
+            setCurrentPolygon({ points: [snappedPos], inverted: false });
+          } else {
+            const firstPoint = currentPolygon.points[0];
+            if (currentPolygon.points.length >= 3 && 
+                distance(pos.x, pos.y, firstPoint.x, firstPoint.y) < CLOSE_POLYGON_DISTANCE) {
+              const newPolygon = {
+                id: Date.now(),
+                points: currentPolygon.points,
+                inverted: false
+              };
+              setPolygons([...polygons, newPolygon]);
+              setCurrentPolygon(null);
+              setSelectedPolygonId(newPolygon.id);
+              setSelectedBlockId(null);
+              setSelectedWallId(null);
+            } else {
+              setCurrentPolygon({
+                ...currentPolygon,
+                points: [...currentPolygon.points, snappedPos]
+              });
+            }
+          }
+        } else if (tool === 'wall') {
+          if (!currentWallStart) {
+            setCurrentWallStart(snappedPos);
+          } else {
+            const newWall = {
+              id: Date.now(),
+              x1: currentWallStart.x,
+              y1: currentWallStart.y,
+              x2: snappedPos.x,
+              y2: snappedPos.y,
+              thickness: wallThickness
+            };
+            setWalls([...walls, newWall]);
+            setCurrentWallStart(null);
+            setSelectedWallId(newWall.id);
+            setSelectedBlockId(null);
+            setSelectedPolygonId(null);
+          }
+        }
+      };
+
+      const handleMouseDown = (e) => {
+        if (isPlaying) return;
+        if (tool === 'pen' || tool === 'wall') return;
+        
+        const pos = getMousePos(e);
+        
+        if (tool === 'place') {
+          const newBlock = {
+            id: Date.now(),
+            x: snapToGrid(pos.x - 25),
+            y: snapToGrid(pos.y - 25),
+            width: 50,
+            height: 50,
+            rotation: 0
+          };
+          setBlocks([...blocks, newBlock]);
+          setSelectedBlockId(newBlock.id);
+          setSelectedWallId(null);
+          setSelectedPolygonId(null);
+        } else if (tool === 'select' || tool === 'move' || tool === 'scale' || tool === 'rotate') {
+          const block = findBlockAtPosition(pos.x, pos.y);
+          if (block) {
+            setSelectedBlockId(block.id);
+            setSelectedWallId(null);
+            setSelectedPolygonId(null);
+            dragStart.current = pos;
+            originalBlock.current = { ...block };
+            return;
+          }
+          
+          const wall = findWallAtPosition(pos.x, pos.y);
+          if (wall) {
+            setSelectedWallId(wall.id);
+            setSelectedBlockId(null);
+            setSelectedPolygonId(null);
+            return;
+          }
+          
+          for (let i = polygons.length - 1; i >= 0; i--) {
+            if (pointInPolygon(pos.x, pos.y, polygons[i].points)) {
+              setSelectedPolygonId(polygons[i].id);
+              setSelectedBlockId(null);
+              setSelectedWallId(null);
+              return;
+            }
+          }
+          
+          setSelectedBlockId(null);
+          setSelectedWallId(null);
+          setSelectedPolygonId(null);
+        }
+      };
+
+      const handleMouseMove = (e) => {
+        const pos = getMousePos(e);
+        setMousePos({ x: snapToGrid(pos.x), y: snapToGrid(pos.y) });
+        
+        if (isPlaying || !dragStart.current || !selectedBlockId) return;
+        
+        const dx = pos.x - dragStart.current.x;
+        const dy = pos.y - dragStart.current.y;
+        
+        setBlocks(blocks.map(block => {
+          if (block.id !== selectedBlockId) return block;
+          
+          if (tool === 'select' || tool === 'move') {
+            return {
+              ...block,
+              x: snapToGrid(originalBlock.current.x + dx),
+              y: snapToGrid(originalBlock.current.y + dy)
+            };
+          } else if (tool === 'scale') {
+            const newWidth = Math.max(20, originalBlock.current.width + dx);
+            const newHeight = Math.max(20, originalBlock.current.height + dy);
+            return {
+              ...block,
+              width: snapToGrid(newWidth),
+              height: snapToGrid(newHeight)
+            };
+          } else if (tool === 'rotate') {
+            const cx = originalBlock.current.x + originalBlock.current.width / 2;
+            const cy = originalBlock.current.y + originalBlock.current.height / 2;
+            const startAngle = Math.atan2(dragStart.current.y - cy, dragStart.current.x - cx);
+            const currentAngle = Math.atan2(pos.y - cy, pos.x - cx);
+            const angleDiff = (currentAngle - startAngle) * 180 / Math.PI;
+            return {
+              ...block,
+              rotation: (originalBlock.current.rotation + angleDiff) % 360
+            };
+          }
+          return block;
+        }));
+      };
+
+      const handleMouseUp = () => {
+        dragStart.current = null;
+        originalBlock.current = null;
+      };
+
+      const checkBlockCollision = (newX, newY, block) => {
+        const cx = block.x + block.width / 2;
+        const cy = block.y + block.height / 2;
+        const angle = -block.rotation * Math.PI / 180;
+        
+        const localX = Math.cos(angle) * (newX - cx) - Math.sin(angle) * (newY - cy) + block.width / 2;
+        const localY = Math.sin(angle) * (newX - cx) + Math.cos(angle) * (newY - cy) + block.height / 2;
+        
+        const closestX = Math.max(0, Math.min(block.width, localX));
+        const closestY = Math.max(0, Math.min(block.height, localY));
+        
+        const distX = localX - closestX;
+        const distY = localY - closestY;
+        const dist = Math.sqrt(distX * distX + distY * distY);
+        
+        return dist < player.radius;
+      };
+
+      const checkWallCollision = (newX, newY, wall) => {
+        const dist = pointToLineDistance(newX, newY, wall.x1, wall.y1, wall.x2, wall.y2);
+        return dist < player.radius + wall.thickness / 2;
+      };
+
+      const checkPolygonEdgeCollision = (newX, newY, points) => {
+        for (let i = 0; i < points.length; i++) {
+          const j = (i + 1) % points.length;
+          const dist = pointToLineDistance(newX, newY, points[i].x, points[i].y, points[j].x, points[j].y);
+          if (dist < player.radius) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      const checkAllCollisions = useCallback((newX, newY) => {
+        for (const block of blocks) {
+          if (checkBlockCollision(newX, newY, block)) {
+            return true;
+          }
+        }
+        
+        for (const wall of walls) {
+          if (checkWallCollision(newX, newY, wall)) {
+            return true;
+          }
+        }
+        
+        for (const polygon of polygons) {
+          if (polygon.inverted) {
+            if (!pointInPolygon(newX, newY, polygon.points)) {
+              return true;
+            }
+          }
+          if (checkPolygonEdgeCollision(newX, newY, polygon.points)) {
+            return true;
+          }
+        }
+        
+        return false;
+      }, [blocks, walls, polygons, player.radius]);
+
+      const movePlayer = useCallback((dx, dy) => {
+        let newX = player.x + dx;
+        let newY = player.y + dy;
+        
+        newX = Math.max(player.radius, Math.min(CANVAS_WIDTH - player.radius, newX));
+        newY = Math.max(player.radius, Math.min(CANVAS_HEIGHT - player.radius, newY));
+        
+        if (!checkAllCollisions(newX, newY)) {
+          setPlayer(prev => ({ ...prev, x: newX, y: newY }));
+        } else {
+          const canMoveX = !checkAllCollisions(player.x + dx, player.y);
+          const canMoveY = !checkAllCollisions(player.x, player.y + dy);
+          
+          if (canMoveX) {
+            newX = Math.max(player.radius, Math.min(CANVAS_WIDTH - player.radius, player.x + dx));
+            setPlayer(prev => ({ ...prev, x: newX }));
+          }
+          if (canMoveY) {
+            newY = Math.max(player.radius, Math.min(CANVAS_HEIGHT - player.radius, player.y + dy));
+            setPlayer(prev => ({ ...prev, y: newY }));
+          }
+        }
+      }, [player, checkAllCollisions]);
+
+      useEffect(() => {
+        const handleKeyDown = (e) => {
+          if (['w', 'a', 's', 'd', 'W', 'A', 'S', 'D'].includes(e.key)) {
+            e.preventDefault();
+            setKeysPressed(prev => ({ ...prev, [e.key.toLowerCase()]: true }));
+          }
+          
+          if ((e.key === 'Delete' || e.key === 'Backspace') && !isPlaying) {
+            if (selectedBlockId) {
+              setBlocks(prev => prev.filter(b => b.id !== selectedBlockId));
+              setSelectedBlockId(null);
+            } else if (selectedWallId) {
+              setWalls(prev => prev.filter(w => w.id !== selectedWallId));
+              setSelectedWallId(null);
+            } else if (selectedPolygonId) {
+              setPolygons(prev => prev.filter(p => p.id !== selectedPolygonId));
+              setSelectedPolygonId(null);
+            }
+          }
+          
+          if (e.key === 'Escape') {
+            setCurrentPolygon(null);
+            setCurrentWallStart(null);
+          }
+        };
+        
+        const handleKeyUp = (e) => {
+          if (['w', 'a', 's', 'd', 'W', 'A', 'S', 'D'].includes(e.key)) {
+            setKeysPressed(prev => ({ ...prev, [e.key.toLowerCase()]: false }));
+          }
+        };
+        
+        window.addEventListener('keydown', handleKeyDown);
+        window.addEventListener('keyup', handleKeyUp);
+        
+        return () => {
+          window.removeEventListener('keydown', handleKeyDown);
+          window.removeEventListener('keyup', handleKeyUp);
+        };
+      }, [selectedBlockId, selectedWallId, selectedPolygonId, isPlaying]);
+
+      useEffect(() => {
+        if (!isPlaying) return;
+        
+        const gameLoop = setInterval(() => {
+          let dx = 0;
+          let dy = 0;
+          
+          if (keysPressed.w) dy -= PLAYER_SPEED;
+          if (keysPressed.s) dy += PLAYER_SPEED;
+          if (keysPressed.a) dx -= PLAYER_SPEED;
+          if (keysPressed.d) dx += PLAYER_SPEED;
+          
+          if (dx !== 0 || dy !== 0) {
+            movePlayer(dx, dy);
+          }
+        }, 16);
+        
+        return () => clearInterval(gameLoop);
+      }, [isPlaying, keysPressed, movePlayer]);
+
+      const deleteSelected = () => {
+        if (selectedBlockId) {
+          setBlocks(blocks.filter(b => b.id !== selectedBlockId));
+          setSelectedBlockId(null);
+        } else if (selectedWallId) {
+          setWalls(walls.filter(w => w.id !== selectedWallId));
+          setSelectedWallId(null);
+        } else if (selectedPolygonId) {
+          setPolygons(polygons.filter(p => p.id !== selectedPolygonId));
+          setSelectedPolygonId(null);
+        }
+      };
+
+      const togglePolygonInvert = () => {
+        if (selectedPolygonId) {
+          setPolygons(polygons.map(p => 
+            p.id === selectedPolygonId ? { ...p, inverted: !p.inverted } : p
+          ));
+        }
+      };
+
+      const exportLevel = () => {
+        const data = {
+          blocks,
+          walls,
+          polygons,
+          playerStart: { x: player.x, y: player.y },
+          backgroundImage
+        };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'level.json';
+        a.click();
+      };
+
+      const importLevel = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            try {
+              const data = JSON.parse(event.target.result);
+              if (data.blocks) setBlocks(data.blocks);
+              if (data.walls) setWalls(data.walls);
+              if (data.polygons) setPolygons(data.polygons);
+              if (data.playerStart) setPlayer(prev => ({ ...prev, ...data.playerStart }));
+              if (data.backgroundImage) setBackgroundImage(data.backgroundImage);
+            } catch (err) {
+              alert('Invalid level file');
+            }
+          };
+          reader.readAsText(file);
+        }
+      };
+
+      const clearAll = () => {
+        setBlocks([]);
+        setWalls([]);
+        setPolygons([]);
+        setCurrentPolygon(null);
+        setCurrentWallStart(null);
+        setSelectedBlockId(null);
+        setSelectedWallId(null);
+        setSelectedPolygonId(null);
+      };
+
+      const selectedBlock = blocks.find(b => b.id === selectedBlockId);
+      const selectedWall = walls.find(w => w.id === selectedWallId);
+      const selectedPolygon = polygons.find(p => p.id === selectedPolygonId);
+
+      return (
+        <div className="flex flex-col h-screen bg-gray-900 text-white p-4">
+          <h1 className="text-2xl font-bold mb-4 text-center">2D Blocking Editor - Demo</h1>
+          
+          <div className="flex gap-4 flex-1 min-h-0">
+            {/* Left Panel */}
+            <div className="w-48 bg-gray-800 rounded-lg p-3 flex flex-col gap-2 overflow-y-auto">
+              <div className="text-sm font-semibold text-gray-400 uppercase">Selection</div>
+              
+              {['select', 'move', 'scale', 'rotate'].map(t => (
+                <button
+                  key={t}
+                  onClick={() => { setTool(t); setCurrentPolygon(null); setCurrentWallStart(null); }}
+                  className={`px-3 py-2 rounded text-sm capitalize transition ${
+                    tool === t ? 'bg-blue-600' : 'bg-gray-700 hover:bg-gray-600'
+                  }`}
+                >
+                  {t === 'select' ? '🔍 ' : t === 'move' ? '✥ ' : t === 'scale' ? '⤡ ' : '↻ '}{t}
+                </button>
+              ))}
+              
+              <div className="border-t border-gray-700 my-2" />
+              <div className="text-sm font-semibold text-gray-400 uppercase">Create</div>
+              
+              <button
+                onClick={() => { setTool('place'); setCurrentPolygon(null); setCurrentWallStart(null); }}
+                className={`px-3 py-2 rounded text-sm transition ${
+                  tool === 'place' ? 'bg-blue-600' : 'bg-gray-700 hover:bg-gray-600'
+                }`}
+              >
+                ◼ Block Tool
+              </button>
+              
+              <button
+                onClick={() => { setTool('wall'); setCurrentPolygon(null); }}
+                className={`px-3 py-2 rounded text-sm transition ${
+                  tool === 'wall' ? 'bg-orange-600' : 'bg-gray-700 hover:bg-gray-600'
+                }`}
+              >
+                ╱ Wall Tool
+              </button>
+              
+              {tool === 'wall' && (
+                <div className="bg-gray-700 p-2 rounded text-xs">
+                  <label className="block text-gray-400 mb-1">Thickness: {wallThickness}px</label>
+                  <input
+                    type="range"
+                    min="2"
+                    max="40"
+                    value={wallThickness}
+                    onChange={(e) => setWallThickness(Number(e.target.value))}
+                    className="w-full"
+                  />
+                  {currentWallStart && (
+                    <p className="text-yellow-400 mt-1">Click to place end point</p>
+                  )}
+                </div>
+              )}
+              
+              <button
+                onClick={() => { setTool('pen'); setCurrentWallStart(null); }}
+                className={`px-3 py-2 rounded text-sm transition ${
+                  tool === 'pen' ? 'bg-green-600' : 'bg-gray-700 hover:bg-gray-600'
+                }`}
+              >
+                ✎ Pen Tool
+              </button>
+              
+              {tool === 'pen' && (
+                <div className="bg-gray-700 p-2 rounded text-xs">
+                  {currentPolygon ? (
+                    <>
+                      <p className="text-green-400">Drawing: {currentPolygon.points.length} points</p>
+                      <p className="text-gray-400 mt-1">Click near start to close</p>
+                      <button
+                        onClick={() => setCurrentPolygon(null)}
+                        className="mt-2 w-full px-2 py-1 bg-red-600 rounded text-xs"
+                      >
+                        Cancel (Esc)
+                      </button>
+                    </>
+                  ) : (
+                    <p className="text-gray-400">Click to start tracing</p>
+                  )}
+                </div>
+              )}
+              
+              <div className="border-t border-gray-700 my-2" />
+              <div className="text-sm font-semibold text-gray-400 uppercase">Options</div>
+              
+              <label className="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" checked={showBlocks} onChange={(e) => setShowBlocks(e.target.checked)} className="w-4 h-4" />
+                Show Blocks
+              </label>
+              
+              <label className="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" checked={showWalls} onChange={(e) => setShowWalls(e.target.checked)} className="w-4 h-4" />
+                Show Walls
+              </label>
+              
+              <label className="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" checked={showPolygons} onChange={(e) => setShowPolygons(e.target.checked)} className="w-4 h-4" />
+                Show Outlines
+              </label>
+              
+              <label className="flex items-center gap-2 text-sm cursor-pointer">
+                <input type="checkbox" checked={gridSnap} onChange={(e) => setGridSnap(e.target.checked)} className="w-4 h-4" />
+                Snap to Grid
+              </label>
+              
+              <div className="border-t border-gray-700 my-2" />
+              
+              <button
+                onClick={() => setIsPlaying(!isPlaying)}
+                className={`px-3 py-2 rounded text-sm font-semibold transition ${
+                  isPlaying ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'
+                }`}
+              >
+                {isPlaying ? '■ Stop' : '▶ Play Test'}
+              </button>
+              
+              <div className="text-xs text-gray-500 mt-1">
+                {isPlaying ? 'Use WASD to move' : 'Click to edit'}
+              </div>
+            </div>
+            
+            {/* Canvas Area */}
+            <div className="flex-1 flex flex-col min-w-0">
+              <div className="flex-1 flex items-center justify-center bg-gray-950 rounded-lg overflow-auto">
+                <div
+                  ref={canvasRef}
+                  className="relative bg-gray-800"
+                  style={{ 
+                    width: CANVAS_WIDTH, 
+                    height: CANVAS_HEIGHT,
+                    backgroundImage: backgroundImage ? `url(${backgroundImage})` : 'none',
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center',
+                    cursor: tool === 'pen' || tool === 'wall' ? 'crosshair' : 'default'
+                  }}
+                  onClick={handleCanvasClick}
+                  onMouseDown={handleMouseDown}
+                  onMouseMove={handleMouseMove}
+                  onMouseUp={handleMouseUp}
+                  onMouseLeave={handleMouseUp}
+                >
+                  {/* Grid */}
+                  {gridSnap && !isPlaying && (
+                    <svg className="absolute inset-0 pointer-events-none" style={{ width: '100%', height: '100%' }}>
+                      <defs>
+                        <pattern id="grid" width={gridSize} height={gridSize} patternUnits="userSpaceOnUse">
+                          <path d={`M ${gridSize} 0 L 0 0 0 ${gridSize}`} fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="0.5"/>
+                        </pattern>
+                      </defs>
+                      <rect width="100%" height="100%" fill="url(#grid)" />
+                    </svg>
+                  )}
+                  
+                  {/* Polygons */}
+                  {showPolygons && (
+                    <svg className="absolute inset-0 pointer-events-none" style={{ width: '100%', height: '100%' }}>
+                      {polygons.map(polygon => (
+                        <g key={polygon.id}>
+                          {polygon.inverted && (
+                            <>
+                              <defs>
+                                <mask id={`mask-${polygon.id}`}>
+                                  <rect width="100%" height="100%" fill="white" />
+                                  <polygon points={polygon.points.map(p => `${p.x},${p.y}`).join(' ')} fill="black" />
+                                </mask>
+                              </defs>
+                              <rect width="100%" height="100%" fill="rgba(128, 0, 128, 0.3)" mask={`url(#mask-${polygon.id})`} />
+                            </>
+                          )}
+                          <polygon
+                            points={polygon.points.map(p => `${p.x},${p.y}`).join(' ')}
+                            fill={polygon.inverted ? 'rgba(0, 255, 0, 0.1)' : 'rgba(0, 255, 0, 0.2)'}
+                            stroke={selectedPolygonId === polygon.id ? '#ffff00' : '#00ff00'}
+                            strokeWidth={selectedPolygonId === polygon.id ? 3 : 2}
+                          />
+                          {polygon.points.map((point, i) => (
+                            <circle key={i} cx={point.x} cy={point.y} r={4} fill={selectedPolygonId === polygon.id ? '#ffff00' : '#00ff00'} />
+                          ))}
+                        </g>
+                      ))}
+                      
+                      {currentPolygon && currentPolygon.points.length > 0 && (
+                        <g>
+                          <polyline
+                            points={[...currentPolygon.points, mousePos].map(p => `${p.x},${p.y}`).join(' ')}
+                            fill="none" stroke="#00ff00" strokeWidth={2} strokeDasharray="5,5"
+                          />
+                          {currentPolygon.points.map((point, i) => (
+                            <circle key={i} cx={point.x} cy={point.y} r={i === 0 ? 8 : 4}
+                              fill={i === 0 ? '#ffff00' : '#00ff00'} stroke={i === 0 ? '#ffffff' : 'none'} strokeWidth={2}
+                            />
+                          ))}
+                          {currentPolygon.points.length >= 3 && 
+                           distance(mousePos.x, mousePos.y, currentPolygon.points[0].x, currentPolygon.points[0].y) < CLOSE_POLYGON_DISTANCE && (
+                            <circle cx={currentPolygon.points[0].x} cy={currentPolygon.points[0].y} r={12} fill="none" stroke="#ffffff" strokeWidth={2} />
+                          )}
+                        </g>
+                      )}
+                    </svg>
+                  )}
+                  
+                  {/* Walls */}
+                  {showWalls && (
+                    <svg className="absolute inset-0 pointer-events-none" style={{ width: '100%', height: '100%' }}>
+                      {walls.map(wall => (
+                        <line key={wall.id} x1={wall.x1} y1={wall.y1} x2={wall.x2} y2={wall.y2}
+                          stroke={selectedWallId === wall.id ? '#ffff00' : '#ff8800'}
+                          strokeWidth={wall.thickness} strokeLinecap="round"
+                        />
+                      ))}
+                      
+                      {selectedWallId && selectedWall && (
+                        <>
+                          <circle cx={selectedWall.x1} cy={selectedWall.y1} r={6} fill="#ffff00" />
+                          <circle cx={selectedWall.x2} cy={selectedWall.y2} r={6} fill="#ffff00" />
+                        </>
+                      )}
+                      
+                      {currentWallStart && (
+                        <>
+                          <line x1={currentWallStart.x} y1={currentWallStart.y} x2={mousePos.x} y2={mousePos.y}
+                            stroke="#ff8800" strokeWidth={wallThickness} strokeLinecap="round" strokeDasharray="10,5"
+                          />
+                          <circle cx={currentWallStart.x} cy={currentWallStart.y} r={6} fill="#ffff00" />
+                        </>
+                      )}
+                    </svg>
+                  )}
+                  
+                  {/* Blocks */}
+                  {showBlocks && blocks.map(block => (
+                    <div
+                      key={block.id}
+                      className={`absolute border-2 transition-colors ${
+                        selectedBlockId === block.id 
+                          ? 'border-yellow-400 bg-yellow-400/30' 
+                          : 'border-red-500/50 bg-red-500/20'
+                      }`}
+                      style={{
+                        left: block.x, top: block.y,
+                        width: block.width, height: block.height,
+                        transform: `rotate(${block.rotation}deg)`,
+                        transformOrigin: 'center center',
+                        pointerEvents: isPlaying ? 'none' : 'auto'
+                      }}
+                    />
+                  ))}
+                  
+                  {/* Player */}
+                  <div
+                    className="absolute rounded-full bg-blue-500 border-2 border-white shadow-lg"
+                    style={{
+                      left: player.x - player.radius,
+                      top: player.y - player.radius,
+                      width: player.radius * 2,
+                      height: player.radius * 2,
+                      transition: isPlaying ? 'none' : 'all 0.1s',
+                      zIndex: 100
+                    }}
+                  >
+                    <div className="absolute w-2 h-2 bg-white rounded-full" style={{ top: 2, left: '50%', transform: 'translateX(-50%)' }} />
+                  </div>
+                </div>
+              </div>
+              
+              {/* Bottom toolbar */}
+              <div className="flex gap-2 mt-3 flex-wrap">
+                <button onClick={() => fileInputRef.current?.click()} className="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm">
+                  📷 Upload Background
+                </button>
+                <input ref={fileInputRef} type="file" accept="image/*" onChange={handleImageUpload} className="hidden" />
+                
+                <button onClick={exportLevel} className="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm">
+                  💾 Export Level
+                </button>
+                
+                <label className="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm cursor-pointer">
+                  📂 Import Level
+                  <input type="file" accept=".json" onChange={importLevel} className="hidden" />
+                </label>
+                
+                <button onClick={clearAll} className="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm">
+                  🗑️ Clear All
+                </button>
+                
+                <div className="flex-1" />
+                
+                <span className="text-gray-500 text-sm self-center">
+                  Blocks: {blocks.length} | Walls: {walls.length} | Outlines: {polygons.length}
+                </span>
+              </div>
+            </div>
+            
+            {/* Right Panel */}
+            <div className="w-56 bg-gray-800 rounded-lg p-3 flex flex-col gap-3 overflow-y-auto">
+              <div className="text-sm font-semibold text-gray-400 uppercase">Properties</div>
+              
+              {selectedBlock ? (
+                <>
+                  <div className="text-xs text-gray-500">Block #{selectedBlock.id}</div>
+                  
+                  {['x', 'y', 'width', 'height', 'rotation'].map(prop => (
+                    <div key={prop} className="space-y-1">
+                      <label className="block text-xs text-gray-400 capitalize">{prop}{prop === 'rotation' ? ' (°)' : ''}</label>
+                      <input
+                        type="number"
+                        value={Math.round(selectedBlock[prop])}
+                        onChange={(e) => setBlocks(blocks.map(b => 
+                          b.id === selectedBlockId ? { ...b, [prop]: Math.max(prop === 'width' || prop === 'height' ? 10 : -Infinity, Number(e.target.value)) } : b
+                        ))}
+                        className="bg-gray-700 px-2 py-1 rounded text-sm w-full"
+                      />
+                    </div>
+                  ))}
+                  
+                  <button onClick={deleteSelected} className="px-3 py-2 bg-red-600 hover:bg-red-700 rounded text-sm w-full mt-2">
+                    Delete Block
+                  </button>
+                </>
+              ) : selectedWall ? (
+                <>
+                  <div className="text-xs text-gray-500">Wall #{selectedWall.id}</div>
+                  
+                  <div className="grid grid-cols-2 gap-2">
+                    {['x1', 'y1', 'x2', 'y2'].map(prop => (
+                      <div key={prop}>
+                        <label className="block text-xs text-gray-400 uppercase">{prop}</label>
+                        <input
+                          type="number"
+                          value={Math.round(selectedWall[prop])}
+                          onChange={(e) => setWalls(walls.map(w => 
+                            w.id === selectedWallId ? { ...w, [prop]: Number(e.target.value) } : w
+                          ))}
+                          className="bg-gray-700 px-2 py-1 rounded text-sm w-full"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                  
+                  <div className="space-y-1">
+                    <label className="block text-xs text-gray-400">Thickness: {selectedWall.thickness}px</label>
+                    <input
+                      type="range" min="2" max="40"
+                      value={selectedWall.thickness}
+                      onChange={(e) => setWalls(walls.map(w => 
+                        w.id === selectedWallId ? { ...w, thickness: Number(e.target.value) } : w
+                      ))}
+                      className="w-full"
+                    />
+                  </div>
+                  
+                  <button onClick={deleteSelected} className="px-3 py-2 bg-red-600 hover:bg-red-700 rounded text-sm w-full mt-2">
+                    Delete Wall
+                  </button>
+                </>
+              ) : selectedPolygon ? (
+                <>
+                  <div className="text-xs text-gray-500">Outline #{selectedPolygon.id}</div>
+                  <div className="text-xs text-gray-400">{selectedPolygon.points.length} points</div>
+                  
+                  <div className="bg-gray-700 p-2 rounded">
+                    <label className="flex items-center gap-2 text-sm cursor-pointer">
+                      <input type="checkbox" checked={selectedPolygon.inverted} onChange={togglePolygonInvert} className="w-4 h-4" />
+                      <span>Invert (Block Outside)</span>
+                    </label>
+                    <p className="text-xs text-gray-400 mt-2">
+                      {selectedPolygon.inverted ? "Player blocked OUTSIDE" : "Edges act as walls only"}
+                    </p>
+                  </div>
+                  
+                  <button onClick={deleteSelected} className="px-3 py-2 bg-red-600 hover:bg-red-700 rounded text-sm w-full mt-2">
+                    Delete Outline
+                  </button>
+                </>
+              ) : (
+                <div className="text-gray-500 text-sm">
+                  Select an item to edit.
+                  <div className="mt-4 text-xs space-y-2">
+                    <p><strong>◼ Block:</strong> Objects/props</p>
+                    <p><strong>╱ Wall:</strong> Point-to-point</p>
+                    <p><strong>✎ Pen:</strong> Map outline</p>
+                  </div>
+                </div>
+              )}
+              
+              <div className="border-t border-gray-700 my-2" />
+              
+              <div className="text-sm font-semibold text-gray-400 uppercase">Player Start</div>
+              
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-xs text-gray-400">X</label>
+                  <input
+                    type="number"
+                    value={Math.round(player.x)}
+                    onChange={(e) => setPlayer(prev => ({ ...prev, x: Number(e.target.value) }))}
+                    className="bg-gray-700 px-2 py-1 rounded text-sm w-full"
+                    disabled={isPlaying}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400">Y</label>
+                  <input
+                    type="number"
+                    value={Math.round(player.y)}
+                    onChange={(e) => setPlayer(prev => ({ ...prev, y: Number(e.target.value) }))}
+                    className="bg-gray-700 px-2 py-1 rounded text-sm w-full"
+                    disabled={isPlaying}
+                  />
+                </div>
+              </div>
+              
+              <div className="mt-auto pt-4 border-t border-gray-700">
+                <div className="text-xs text-gray-500 space-y-1">
+                  <p><strong>Shortcuts:</strong></p>
+                  <p>Delete - Remove selected</p>
+                  <p>Escape - Cancel drawing</p>
+                  <p>WASD - Move (Play mode)</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    };
+
+    // Render the app
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<LevelEditor />);
+  </script>
+</body>
+</html>
